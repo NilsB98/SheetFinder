@@ -1,48 +1,64 @@
 import argparse
-import json
-from typing import List, Dict
-import requests
 import asyncio
+import json
+import re
+from typing import List, Tuple
+
+import pandas as pd
+import requests
 from pyppeteer import launch
 from tqdm import tqdm
-import re
 
-SPOTIFY_PLAYLIST_LINK = 'https://open.spotify.com/playlist/6V2aRX79ReETLpZWL4fJ63?si=32a1d88ec58c4b2d'
+from customtypes import SpotifySongInfo, MusescoreSongInfo, SongSearch
+
 playlist_id = '6V2aRX79ReETLpZWL4fJ63'
-api_url = 'https://api.spotify.com/v1/playlists/' + playlist_id
-spotify_token = 'XX'
+spotify_token = ''
 
 
 # get API-token:
-# https://developer.spotify.com/console/get-playlist/?playlist_id=3cEYpjA9oz9GiPac4AsH4n&market=ES&fields=items(added_by.id%2Ctrack(name%2Chref%2Calbum(name%2Chref)))&additional_types=
+# https://developer.spotify.com/console/get-playlist/
 
 
-def get_spotify_playlist_details():
+def get_spotify_playlist_details(playlist_url: str) -> List[SpotifySongInfo]:
     """
     Return dict of all titles and their artists in the spotify playlist.
 
     :return:
     """
-    r = requests.get('https://api.spotify.com/v1/playlists/'+playlist_id,
+
+    r = requests.get(playlist_url,
                      headers={
                          'Authorization': f'Bearer {spotify_token}'},
                      )
 
-    content = json.loads(r.content)["tracks"]["items"]
+    content = json.loads(r.content)
+
+    if "tracks" in content:
+        tracks = content["tracks"]
+    else:
+        tracks = content
+
+    items = tracks["items"]
+    next_url = tracks["next"]
     song_details = list(
-        map(lambda item: {'title': item["track"]["name"], 'artist': item["track"]["artists"][0]["name"]}, content))
+        map(lambda item: {'title': item["track"]["name"], 'artist': item["track"]["artists"][0]["name"]}, items))
+
+    if next_url is not None:
+        song_details.extend(get_spotify_playlist_details(next_url))
 
     return song_details
 
 
-async def find_musescore_sheet(title: str, artist: str, s_instrument='piano', s_kind='solo'):
+async def find_musescore_sheet(search: SongSearch) -> List[MusescoreSongInfo]:
     browser = await launch()
     page = await browser.newPage()
-    musescore_url = 'https://musescore.com/sheetmusic?text=' + f'{title} {artist}'.replace(' ', '%20')
-    # print(musescore_url)
-    await page.goto(musescore_url,
-                    {'waitUntil': 'networkidle0'})
+    musescore_url = f'https://musescore.com/sheetmusic?text={search["title"]} {search["artist"]}' \
+        .replace(' ', '%20')
 
+    # wait for the page to be fully loaded
+    await page.goto(musescore_url, {'waitUntil': 'networkidle0'})
+
+    # search the sheet music on the page
     sheet_nodes = await page.JJ('.EzJvq')
 
     results = []
@@ -53,52 +69,84 @@ async def find_musescore_sheet(title: str, artist: str, s_instrument='piano', s_
         kind = await node.JJeval('.C4LKv.fLob3.DIiWA', '(nodes => nodes.map(n => n.innerText))')
         instrument = await node.JJeval('.C4LKv.B6vE9.DIiWA.z99NF', '(nodes => nodes.map(n => n.innerText))')
 
-        if s_kind.lower() == kind[0].lower() and s_instrument.lower() in instrument[0].lower() and len(votes) > 0:
-            vote_count: int = int(votes[0].split(' ')[0])  # take the elem from list, remove redundant string and cast int
-            results.append({'votes': vote_count, 'link': link, 'title': title, 'kind': kind, 'instrument': instrument})
+        if len(votes) > 0 and search["kind"].lower() == kind[0].lower() and search["instrument"].lower() in instrument[
+            0].lower():
+            # format votes accordingly (possible e.g. 1K oder 1.7K)
+            vote_formatted = votes[0].split(' ')[0]
+            match = re.search('\\.[0-9]K', vote_formatted)
+            if match != None:
+                vote_formatted = vote_formatted.replace('.', '')
+                vote_formatted = vote_formatted.replace('K', '00')
+
+            vote_formatted = vote_formatted.replace('K', '000')
+
+            vote_count: int = int(vote_formatted)  # take the elem from list, remove redundant string and cast int
+            results.append(
+                {'votes': vote_count, 'link': link[0], 'title': title, 'kind': kind, 'instrument': instrument})
 
     await browser.close()
     return results
 
 
-async def find_musescore_sheets(song_details: List[Dict]):
+async def find_musescore_sheets(song_details: List[SpotifySongInfo], instrument: str, kind: str) \
+        -> List[Tuple[SongSearch, MusescoreSongInfo]]:
     mappings = []
+
     for info in tqdm(song_details):
-        sheet_recommendations = await find_musescore_sheet(**info)
+        sheet_recommendations = await find_musescore_sheet(info | {'instrument': instrument, 'kind': kind})
 
         # filter all search results for which no results were found
         if len(sheet_recommendations) > 0:
             # only keep the sheet with the most votes
             sheet_recommendations = sheet_recommendations[0]
 
-            mappings.append((info["title"], sheet_recommendations))
+            mappings.append((info, sheet_recommendations))
 
     return mappings
 
 
-async def main():
-    song_details = get_spotify_playlist_details()
-    recommendations = await find_musescore_sheets(song_details[:2])
-    recommendations.sort(key=lambda r: r[1]["votes"], reverse=True)
+def recommendations_to_df(recommendations: List[Tuple[SongSearch, MusescoreSongInfo]]) -> pd.DataFrame:
+    data = {
+        "title": [],
+        "artist": [],
+        "link": [],
+        "votes": []
+    }
 
     for recommendation in recommendations:
-        print(f'{recommendation[0]}: {recommendation[1]["link"][0]} ({recommendation[1]["votes"]} votes)')
+        data["title"].append(recommendation[0]["title"])
+        data["artist"].append(recommendation[0]["artist"])
+        data["link"].append(recommendation[1]["link"])
+        data["votes"].append(recommendation[1]["votes"])
+
+    return pd.DataFrame(data)
+
+
+async def main(instrument='piano', kind='solo'):
+    song_details = get_spotify_playlist_details('https://api.spotify.com/v1/playlists/' + playlist_id)
+    recommendations = await find_musescore_sheets(song_details[:5], instrument, kind)
+
+    df = recommendations_to_df(recommendations)
+    df.sort_values(by='votes', ascending=False, inplace=True)
+    df.to_csv('sheets2.csv', ';', index=False)
 
 
 if __name__ == '__main__':
-    print(
-        "get the spotify token here: \nhttps://developer.spotify.com/console/get-playlist/?playlist_id=3cEYpjA9oz9GiPac4AsH4n&market=ES&fields=items(added_by.id%2Ctrack(name%2Chref%2Calbum(name%2Chref)))&additional_types=")
     parser = argparse.ArgumentParser(
         prog='SpoticoreFinder',
-        description='Search for the most voted music sheets on musescore for songs from a spotify playlist',
-        epilog='Thanks')
+        description='Search for the most voted music sheets on musescore for songs from a spotify playlist')
 
-    parser.add_argument('token', type=str)
+    parser.add_argument('token', type=str,
+                        help='get the spotify token here: \n https://developer.spotify.com/console/get-playlist')
+    parser.add_argument('playlist', type=str,
+                        help='the link to the spotify playlist')
+    # TODO add args for instrument and kind
+
     args = parser.parse_args()
 
     spotify_token = args.token
 
-    res = re.search('/[^/]*\\?', SPOTIFY_PLAYLIST_LINK)
+    res = re.search('/[^/]*\\?', args.playlist)
     playlist_id = res.group()[1:-1]
 
     asyncio.run(main())
